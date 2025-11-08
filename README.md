@@ -13,3 +13,4 @@ The project is divided in sections:
 
 This seems like a Multiclass problem rather than multi-label problem. 
   
+<img width="406" height="204" alt="immagine" src="https://github.com/user-attachments/assets/51784b4f-6b99-4b2f-8117-c427efe1a189" />
