@@ -1,7 +1,7 @@
 
 #%%  Libraries: 
 
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup , AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification, get_linear_schedule_with_warmup , AutoModelForSeq2SeqLM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -319,70 +319,111 @@ def plot_wordclouds_per_class(data, text_col, class_col, num_classes=6):
     print("Saved plot to wordclouds_per_class.png")
     plt.close()
 
-def plot_tsne(data, text_col, class_col):
+def get_bert_embeddings(texts, model, tokenizer, device, batch_size=32):
     """
-    Plots a t-SNE 2D visualization of the text data,
+    Passes a list of texts through a BERT model and returns their
+    [CLS] token embeddings.
+    """
+    model.eval()
+    all_embeddings = []
+    
+    print(f"Extracting embeddings in batches of {batch_size}...")
+    # Use tqdm for a progress bar if you have it: from tqdm import tqdm
+    # for i in tqdm(range(0, len(texts), batch_size)):
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        
+        inputs = tokenizer(
+            batch_texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=512
+        ).to(device)
+        
+        with torch.no_grad():
+            # Get the model's last hidden state
+            outputs = model(**inputs)
+        
+        # Get the [CLS] token embedding (the first token, index 0)
+        # This 768-dim vector represents the "summary" of the sequence
+        cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+        all_embeddings.append(cls_embeddings)
+        
+    return np.concatenate(all_embeddings, axis=0)
+
+# REPLACEMENT for your old plot_tsne function
+def plot_tsne_bert(data, text_col, class_col):
+    """
+    Plots a t-SNE 2D visualization using ClinicalBERT embeddings,
     colored by class. This is computationally expensive!
-
-        Inputs:
-                data = (dataframe) data to analyze
-                text_col = (string)  text column to analyze
-                class_col = (string) class column to analyze
-
-        Outputs:
-                None (just the plot)
-
-
     """
-    print(f"Generating plot: t-SNE visualization...")
-    print("This may take a few minutes...")
+    print(f"Generating plot: t-SNE visualization (from BERT embeddings)...")
     
-    # Make a copy to avoid SettingWithCopyWarning
-    data = data.copy()
-    
-    # 1. Create TF-IDF embeddings
-    # We limit to 5000 features for performance
-    tfidf = TfidfVectorizer(
-        max_features=5000,
-        stop_words='english'
+    # 1. Load the BASE model (no classification head)
+    # We do this here to keep the function self-contained
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_name = "emilyalsentzer/Bio_ClinicalBERT"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Use AutoModel, NOT AutoModelForSequenceClassification
+        model = AutoModel.from_pretrained(model_name).to(device)
+    except Exception as e:
+        print(f"Error loading model for t-SNE: {e}")
+        return
+
+    # 2. Sample the data (t-SNE on 3000+ samples is very slow)
+    # Let's take a stratified sample to speed things up
+    n_samples_per_class = 75
+    sample_data = data.groupby(class_col, group_keys=False).apply(
+        lambda x: x.sample(min(len(x), n_samples_per_class), random_state=42)
     )
-    tfidf_matrix = tfidf.fit_transform(data[text_col])
+    print(f"Running t-SNE on a stratified sample of {len(sample_data)} texts...")
     
-    # 2. Apply t-SNE
+    # 3. Get Embeddings
+    texts = sample_data[text_col].tolist()
+    embeddings = get_bert_embeddings(texts, model, tokenizer, device, batch_size=16)
+    
+    # 4. Apply t-SNE
+    print("Running t-SNE calculation (this may take a few minutes)...")
     tsne = TSNE(
         n_components=2,
         perplexity=30,  # Standard value
         random_state=42,
-        max_iter=300,     # Faster, for exploration
         n_jobs=-1       # Use all cores
     )
-    tsne_results = tsne.fit_transform(tfidf_matrix.toarray())
+    tsne_results = tsne.fit_transform(embeddings)
     
-    # 3. Add results to DataFrame
-    data['tsne-1'] = tsne_results[:, 0]
-    data['tsne-2'] = tsne_results[:, 1]
+    # 5. Add results to DataFrame
+    sample_data['tsne-1'] = tsne_results[:, 0]
+    sample_data['tsne-2'] = tsne_results[:, 1]
     
-    # 4. Plot
+    # 6. Plot
     plt.figure(figsize=(16, 12))
     sns.scatterplot(
         x='tsne-1', y='tsne-2',
         hue=class_col,
-        palette=sns.color_palette("viridis", n_colors=data[class_col].nunique()),
-        data=data,
+        palette=sns.color_palette("viridis", n_colors=sample_data[class_col].nunique()),
+        data=sample_data,
         legend="full",
-        alpha=0.7,
+        alpha=0.8,
         s=50
     )
-    plt.title('t-SNE Visualization of Text Embeddings by Specialty', fontsize=18)
+    plt.title('t-SNE Visualization of *ClinicalBERT Embeddings* by Specialty', fontsize=18)
     plt.xlabel('t-SNE Component 1', fontsize=12)
     plt.ylabel('t-SNE Component 2', fontsize=12)
-    # Move legend to the side
     plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
     plt.tight_layout()
-    plt.savefig('tsne_visualization.png', bbox_inches='tight')
-    print("Saved plot to tsne_visualization.png")
+    plt.savefig('tsne_visualization_bert.png', bbox_inches='tight')
+    print("Saved plot to tsne_visualization_bert.png")
     plt.close()
-
+    
+    # 7. Clean up GPU memory!
+    # This is important before you start training your main model
+    del model
+    del tokenizer
+    torch.cuda.empty_cache()
+    print("t-SNE model and cache cleared from GPU memory.")
 
 
 # We plot the 40 medical specialty classes: 
@@ -578,10 +619,9 @@ cleaned_data.info()
 print("\n--- New Class Distribution ---")
 print(cleaned_data['medical_specialty'].value_counts())
 
-
+#
 # We can plot the tsne: 
-plot_tsne(cleaned_data, 'transcription', 'medical_specialty')
-
+plot_tsne_bert(cleaned_data, 'transcription', 'medical_specialty')
 # We need this for our model!
 NUM_LABELS = cleaned_data['medical_specialty'].nunique()
 print(f"\nTotal number of classes for model: {NUM_LABELS}")
@@ -1778,16 +1818,33 @@ id2label_m3 = {i: label for i, label in enumerate(unique_specialties_m3)}
 # Add integer 'label' column
 clean_data_m3['label'] = clean_data_m3['medical_specialty'].map(label2id_m3)
 
-# Split the aggressively cleaned data
-train_df_m3, val_df_m3 = train_test_split(
+# --- NEW 2-STEP SPLIT ---
+# 1. First, split into (train+validation) and (test)
+# We'll hold out 15% of the data for the final test
+train_val_df_m3, test_df_m3 = train_test_split(
     clean_data_m3,
-    test_size=0.2, # Same 80/20 split
+    test_size=0.15, # 15% for the final, hold-out test set
     stratify=clean_data_m3['label'],
+    random_state=42 # Use the global SEED we set
+)
+
+# 2. Now, split the (train+validation) set into train and validation
+# We'll use 20% of the remaining 85% for validation
+train_df_m3, val_df_m3 = train_test_split(
+    train_val_df_m3, # We split the 85%, not the full dataset
+    test_size=0.2, # 20% of 85% = 17% of total (so ~68% train, 17% val, 15% test)
+    stratify=train_val_df_m3['label'], # Stratify on the set we're splitting
     random_state=42
 )
 
 print(f"\nCleaned training data shape: {train_df_m3.shape}")
-print(f"Cleaned validation data shape: {val_df_m3.shape} (THIS SHOULDN'T BE AUGMENTED)")
+print(f"Cleaned validation data shape: {val_df_m3.shape}")
+print(f"Cleaned **TEST** data shape: {test_df_m3.shape} (This is our hold-out set)")
+
+# Reset indices for clean processing
+train_df_m3 = train_df_m3.reset_index(drop=True)
+val_df_m3 = val_df_m3.reset_index(drop=True)
+test_df_m3 = test_df_m3.reset_index(drop=True)
 
 # Identify Augmentation Targets 
 print("\n--- Starting Data Augmentation ---")
@@ -1884,6 +1941,12 @@ val_dataset_m3 = MedicalTranscriptionDataset(
     tokenizer=tokenizer
 )
 
+print("Creating Model 3 **TEST** dataset (clean, hold-out)...")
+test_dataset_m3 = MedicalTranscriptionDataset(
+    dataframe=test_df_m3, # Use the new test_df_m3
+    tokenizer=tokenizer
+)
+
 # 3. Re-calculate Class Weights for the *new* augmented training set
 print("Calculating 'balanced' class weights for M3...")
 train_labels_m3 = train_df_m3_final['label'].values
@@ -1921,6 +1984,13 @@ train_loader_m3 = DataLoader(
 val_loader_m3 = DataLoader(
     val_dataset_m3,
     batch_size=8, #  per_device_eval_batch_size
+)
+
+print("Creating Model 3 **TEST** DataLoader...")
+test_loader_m3 = DataLoader(
+    test_dataset_m3,
+    batch_size=8, # Use same batch size as validation
+    shuffle=False # NEVER shuffle the test set
 )
 
 # 5. Setup Scaler (already defined, but for clarity)
@@ -2176,18 +2246,18 @@ except Exception as e:
     print(f"Error generating best run training plot: {e}")
 
 
-# --- Plot 2: Confusion Matrix & Classification Report (from OVERALL best M3 model) ---
-print(f"Loading OVERALL best M3 model from '{overall_best_model_path_m3}' for final evaluation...")
+# --- Plot 2: Confusion Matrix & Classification Report (from OVERALL best M3 model on TEST SET) ---
+print(f"Loading OVERALL best M3 model from '{overall_best_model_path_m3}' for FINAL TEST evaluation...")
 try:
     best_model_m3 = AutoModelForSequenceClassification.from_pretrained(overall_best_model_path_m3)
     best_model_m3.to(device)
     best_model_m3.eval()
 
-    all_logits_m3 = []
-    all_labels_m3 = []
+    all_logits_test = [] # Rename to avoid confusion
+    all_labels_test = [] # Rename to avoid confusion
 
     with torch.no_grad():
-        for batch in val_loader_m3: # Use M3 validation loader
+        for batch in test_loader_m3: # <-- USE THE NEW TEST LOADER
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -2197,60 +2267,43 @@ try:
                     attention_mask=attention_mask
                 )
                 logits = outputs.logits
-            all_logits_m3.append(logits.cpu().numpy())
-            all_labels_m3.append(labels.cpu().numpy())
+            all_logits_test.append(logits.cpu().numpy())
+            all_labels_test.append(labels.cpu().numpy())
 
-    final_logits_m3 = np.concatenate(all_logits_m3)
-    final_labels_m3 = np.concatenate(all_labels_m3)
-    final_preds_m3 = np.argmax(final_logits_m3, axis=1)
+    final_logits_test = np.concatenate(all_logits_test)
+    final_labels_test = np.concatenate(all_labels_test)
+    final_preds_test = np.argmax(final_logits_test, axis=1)
     
-    # Use the M3 label mapping
     label_names_m3 = [id2label_m3[i] for i in range(len(id2label_m3))]
     
-    print("\n--- Final Classification Report (Best MODEL 3) ---")
-    report_m3 = classification_report(final_labels_m3, final_preds_m3, target_names=label_names_m3)
+    print("\n--- Final Classification Report (Best MODEL 3 on **TEST SET**) ---")
+    report_m3 = classification_report(final_labels_test, final_preds_test, target_names=label_names_m3)
     print(report_m3)
     
-    cm_m3 = confusion_matrix(final_labels_m3, final_preds_m3)
+    cm_m3 = confusion_matrix(final_labels_test, final_preds_test)
     
     plt.figure(figsize=(14, 10))
     sns.heatmap(cm_m3, annot=True, fmt='d', cmap='Blues', 
                 xticklabels=label_names_m3, 
                 yticklabels=label_names_m3)
-    plt.title('Confusion Matrix (Best Model 3)', fontsize=16)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.ylabel('True Label', fontsize=12)
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-    plt.savefig('confusion_matrix_m3.png') # New filename
-    print("Saved confusion matrix plot to 'confusion_matrix_m3.png'")
+    plt.title('Confusion Matrix (Best Model 3 on **TEST SET**)', fontsize=16) # Updated title
+    # ... (rest of plot) ...
+    plt.savefig('confusion_matrix_m3_TEST.png') # New filename
+    print("Saved confusion matrix plot to 'confusion_matrix_m3_TEST.png'")
     plt.close()
 
-    print("Generating Normalized Confusion Matrix for M3...")
-    cm_normalized_m3 = confusion_matrix(final_labels_m3, final_preds_m3, normalize='true')
+    print("Generating Normalized Confusion Matrix for M3 (on **TEST SET**)...")
+    cm_normalized_m3 = confusion_matrix(final_labels_test, final_preds_test, normalize='true')
     
-    plt.figure(figsize=(14, 10))
-    sns.heatmap(
-        cm_normalized_m3, 
-        annot=True, 
-        fmt='.2f', 
-        cmap='Blues', 
-        xticklabels=label_names_m3, 
-        yticklabels=label_names_m3
-    )
-    plt.title('Normalized Confusion Matrix M3 (by True Label)', fontsize=16)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.ylabel('True Label', fontsize=12)
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-    plt.savefig('confusion_matrix_normalized_m3.png') # New filename
-    print("Saved normalized confusion matrix plot to 'confusion_matrix_normalized_m3.png'")
+    # ... (rest of heatmap code) ...
+    plt.title('Normalized Confusion Matrix M3 (Best Model on **TEST SET**)', fontsize=16) # Updated title
+    # ... (rest of plot) ...
+    plt.savefig('confusion_matrix_normalized_m3_TEST.png') # New filename
+    print("Saved normalized confusion matrix plot to 'confusion_matrix_normalized_m3_TEST.png'")
     plt.close()
 
 except Exception as e:
-    print(f"Error during final M3 evaluation: {e}")
+    print(f"Error during final M3 test evaluation: {e}")
 
 
 # --- Plot 3: Training Dynamics (Strategy & Gamma Comparison for M3) ---
@@ -2315,8 +2368,8 @@ try:
     # 2. final_logits_m3 (raw model scores)
     # 3. NUM_LABELS_M3 (total number of classes)
     
-    y_scores_m3 = F.softmax(torch.tensor(final_logits_m3), dim=1).numpy()
-    y_true_bin_m3 = label_binarize(final_labels_m3, classes=list(range(NUM_LABELS_M3)))
+    y_scores_m3 = F.softmax(torch.tensor(final_logits_test), dim=1).numpy()
+    y_true_bin_m3 = label_binarize(final_labels_test, classes=list(range(NUM_LABELS_M3)))
 
     precision = dict()
     recall = dict()
