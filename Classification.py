@@ -1,7 +1,7 @@
 
 #%%  Libraries: 
 
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup , AutoModelForSeq2SeqLM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -484,7 +484,7 @@ except Exception as e:
 # Apply Back Translation:
 
     # Take the transcription text for the minority classes in train_df.
-    # Run them through a back-translation pipeline (e.g., en-de-en or en-fr-en).  
+    # Run them through a back-translation pipeline (e.g., en-de-en or en-it-en).  
     # We can even do it 2-3 times with different languages (e.g., French, German, Spanish) to get multiple variations for each original sample (As Francesco suggested). 
     # Create the New Training Set: Combine the original train_df with the new, augmented-minority-class samples.
     # Re-Train: Train the ClinicalBERT model (Model 2) on this new, larger, and more balanced training set. We should still use the weighted loss function, as the data will likely still be imbalanced, just less severely.
@@ -609,7 +609,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 # This automatically adds a classification layer (the "head") on top of the base ClinicalBERT model.
 model = AutoModelForSequenceClassification.from_pretrained(
     model_name, 
-    num_labels=NUM_LABELS  # <--- THIS IS CORRECT HERE
+    num_labels=NUM_LABELS  
 )
 
 # Check if your GPU is available
@@ -617,7 +617,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 print(f"Model loaded on: {device}")
 
-# --- Example of tokenizing a single transcription ---
+# tokenizing a single transcription
 sample_text = cleaned_data['transcription'].iloc[0]
 inputs = tokenizer(sample_text, 
                    return_tensors="pt",  # Return PyTorch tensors
@@ -635,7 +635,7 @@ class FocalLoss(nn.Module):
     """
     Custom Focal Loss module.
     
-    This combines the class-balancing 'alpha' (the weights_tensor) 
+    This combines the class-balancing 'alpha' (the balance_weights_tensor) 
     and the easy-example-focusing 'gamma'.
 
     The idea behind this is to exploit the cross entrophy: 
@@ -650,7 +650,7 @@ class FocalLoss(nn.Module):
         """
         Args:
             alpha (torch.Tensor, optional): A tensor of weights for each class. 
-                                            This is the 'weights_tensor'.
+                                            This is the 'balance_weights_tensor'.
                                             Shape: (num_classes,)
             gamma (float, optional): The focusing parameter. Defaults to 2.0.
             reduction (str, optional): 'mean', 'sum', or 'none'. Defaults to 'mean'.
@@ -725,6 +725,7 @@ class FocalLoss(nn.Module):
 #Get unique specialties:
 unique_specialties = sorted(cleaned_data['medical_specialty'].unique())
 
+
 # Create mappings
 # label2id: {'Cardiovascular / Pulmonary': 0, 'Neurology': 1, ...}
 label2id = {label: i for i, label in enumerate(unique_specialties)}
@@ -759,26 +760,42 @@ val_df = val_df.reset_index(drop=True)
 
 # We calculate class weights to implement the weighted loss function 
 
-print("Calculating class weights...")
-# Get the unique labels and their counts from the training set
+# Strategy 1: 'balanced' (original model)
+print("Calculating 'balanced' class weights...")
 train_labels = train_df['label'].values
 unique_labels = np.unique(train_labels)
 
-# Calculate weights
-class_weights = compute_class_weight(       # We can use 
+class_weights_balanced = compute_class_weight(
     'balanced', 
     classes=unique_labels, 
     y=train_labels
 )
+balanced_weights_tensor = torch.tensor(class_weights_balanced, dtype=torch.float).to(device)
 
-# Convert to a PyTorch tensor and move to the GPU
-weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
-print(f"Computed {len(weights_tensor)} class weights.")
 
-# Create the Loss function: 
-# We will use this to calculate loss manually
-# loss_fct = torch.nn.CrossEntropyLoss(weight=weights_tensor) # Using only the weighted loss
-loss_fct = FocalLoss(alpha=weights_tensor, gamma=2.0)   # Using weighted loss + Focus Loss
+# Strategy 2: 'log_smoothed' (The new method)
+print("Calculating 'log_smoothed' class weights...")
+counts = train_df['label'].value_counts().sort_index()
+
+# Use log(count + 1) to smooth. Add epsilon for stability if a class had 0.
+log_weights = 1.0 / np.log(counts.values + 1e-6)
+
+# Normalize weights so their sum is roughly the number of classes
+log_weights = (log_weights / np.sum(log_weights)) * NUM_LABELS
+
+log_smoothed_weights_tensor = torch.tensor(log_weights, dtype=torch.float).to(device)
+
+
+# This dictionary will be looped over.
+# We also add 'unweighted' to test pure Focal Loss (alpha=None)
+weight_strategies = {
+    "balanced": balanced_weights_tensor,
+    "log_smoothed": log_smoothed_weights_tensor,
+    "unweighted": None  # This will pass alpha=None to FocalLoss
+}
+
+print(f"\nCreated {len(weight_strategies)} weighting strategies to test: {list(weight_strategies.keys())}")
+
 
 #%% Create PyTorch Dataset Class
 
@@ -853,8 +870,9 @@ print("Label (string):", id2label[sample['labels'].item()])
 
 # %%  Training and  Visualization: 
 
-# %% Model Training, Visualization, and Final Evaluation
-# This cell now includes the gamma search loop and differential learning rates.
+#%% Model Training, Visualization, and Final Evaluation
+# This cell now includes the gamma search loop, differential learning rates,
+# AND the new weighting strategy comparison.
 
 # Define Compute Metrics Function 
 def compute_metrics(eval_pred):
@@ -863,7 +881,7 @@ def compute_metrics(eval_pred):
     'eval_pred' is a tuple (logits, labels).
     """
     predictions, labels = eval_pred
-    preds = np.argmax(predictions, axis=1)  # Get the index of the max logit
+    preds = np.argmax(predictions, axis=1) # Get the index of the max logit
     f1 = f1_score(labels, preds, average="weighted")
     acc = accuracy_score(labels, preds)
     b_acc = balanced_accuracy_score(labels, preds)
@@ -878,237 +896,222 @@ def compute_metrics(eval_pred):
 print("Creating DataLoaders...")
 train_loader = DataLoader(
     train_dataset,
-    batch_size=4,  # Your per_device_train_batch_size
-    shuffle=True,  # Shuffle training data
+    batch_size=4, # per_device_train_batch_size
+    shuffle=True, # Shuffle training data
 )
 val_loader = DataLoader(
     val_dataset,
-    batch_size=8,  # Your per_device_eval_batch_size
+    batch_size=8, #  per_device_eval_batch_size
 )
 
 # Setup Scaler 
 scaler = GradScaler(device="cuda")
 
 # 4. Training Configuration 
-num_train_epochs = 3  # The sweetspot for Fine-Tuning is 3-5 epochs, otherwise: Risk of Overfitting or Catastrophic Forgetting 
+num_train_epochs = 3 
 output_dir = "./clinical_bert_classifier"
-accumulation_steps = 4  # The gradient_accumulation_steps
+accumulation_steps = 4 
 
 # Hyperparameter Search Setup 
-gamma_values_to_test = [0, 1.0, 2.0, 3.0, 4.0]  # Test these gamma values (we also try gamma =  0 which is basically only the weighted loss function)
+gamma_values_to_test = [1.0, 2.0, 3.0] # <-- Reduced for speed 
 all_experiment_results = []
-all_training_histories = []     # We store the history of Gamma 
+all_training_histories = [] 
 
 overall_best_f1 = 0.0
-overall_best_model_path = ""  # We'll store the path to the best *overall* model
+overall_best_model_path = "" 
 
-for gamma_val in gamma_values_to_test:
-    print(f"\n========================================================")
-    print(f"--- STARTING EXPERIMENT WITH GAMMA = {gamma_val} ---")
-    print(f"========================================================")
-
-    # Re-initialize model for a fresh run ---
-    # THIS MUST BE INDENTED to be inside the loop
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        # We re-use the config with label mappings from the cell above
-        # This config object ALREADY has num_labels built-in
-        config=model.config
-    ).to(device)
+# ---OUTER LOOP FOR WEIGHTING STRATEGY ---
+for strategy_name, alpha_tensor in weight_strategies.items():
     
-    # Setup Optimizer with Differential Learning Rates ---
-    lr_head = 1e-4  # Higher LR for the new classification head
-    lr_body = 2e-5  # Lower LR for the pre-trained BERT body
+    # --- INNER LOOP FOR GAMMA ---
+    for gamma_val in gamma_values_to_test:
+        print(f"\n========================================================")
+        print(f"--- STARTING EXPERIMENT ---")
+        print(f"--- STRATEGY: {strategy_name}")
+        print(f"--- GAMMA:    {gamma_val}")
+        print(f"========================================================")
 
-    # (and so on... all the code for this experiment must be indented)
-    head_param_names = []
-    for name, param in model.named_parameters():
-        if name.startswith('classifier'):
-            head_param_names.append(name)
-    
-    # ... all the rest of your optimizer, scheduler, and training code ...
-    # 3. Create two lists of parameters (parameter groups)
-    params_body = [
-        param for name, param in model.named_parameters()
-        if name not in head_param_names and param.requires_grad
-    ]
-    params_head = [
-        param for name, param in model.named_parameters()
-        if name in head_param_names and param.requires_grad
-    ]
+        # Re-initialize model for a fresh run
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            config=model.config # Re-use config with label mappings
+        ).to(device)
+        
+        # Setup Optimizer with Differential Learning Rates
+        lr_head = 1e-4 
+        lr_body = 2e-5 
 
-    # 4. Create the parameter groups dictionary for the optimizer
-    optimizer_grouped_parameters = [
-        {'params': params_body, 'lr': lr_body},
-        {'params': params_head, 'lr': lr_head}
-    ]
+        head_param_names = [name for name, param in model.named_parameters() if name.startswith('classifier')]
+        
+        params_body = [
+            param for name, param in model.named_parameters()
+            if name not in head_param_names and param.requires_grad
+        ]
+        params_head = [
+            param for name, param in model.named_parameters()
+            if name in head_param_names and param.requires_grad
+        ]
 
-    # 5. Create the optimizer with these groups
-    optimizer = optim.AdamW(optimizer_grouped_parameters)
+        optimizer_grouped_parameters = [
+            {'params': params_body, 'lr': lr_body},
+            {'params': params_head, 'lr': lr_head}
+        ]
 
-    print(f"Optimizer created with {len(params_body)} param groups for body (LR={lr_body}) "
-          f"and {len(params_head)} for head (LR={lr_head}).")
-    #  End Optimizer 
+        optimizer = optim.AdamW(optimizer_grouped_parameters)
 
-    #  Create Loss Function using loop variable 
-    # We still use weights_tensor (alpha), but pass the current gamma_val
-    loss_fct = FocalLoss(alpha=weights_tensor, gamma=gamma_val)
-    print(f"FocalLoss created with gamma = {gamma_val}")
-    
-    # Make best_model_path unique for this run 
-    best_model_path = f"{output_dir}/best_model_gamma_{gamma_val}"
+        print(f"Optimizer created with {len(params_body)} param groups for body (LR={lr_body}) "
+              f"and {len(params_head)} for head (LR={lr_head}).")
 
-    # --- Scheduler Setup 
-    # Calculate total training steps
-    num_training_steps = (len(train_loader) // accumulation_steps) * num_train_epochs
-    num_warmup_steps = int(num_training_steps * 0.1)  # 10% warmup is a good default
+        # Create Loss Function using loop variables
+        # alpha_tensor comes from our new outer loop
+        # gamma_val comes from our inner loop
+        loss_fct = FocalLoss(alpha=alpha_tensor, gamma=gamma_val)
+        print(f"FocalLoss created with strategy='{strategy_name}' and gamma={gamma_val}")
+        
+        # Make best_model_path unique for this run
+        best_model_path = f"{output_dir}/best_model_strategy_{strategy_name}_gamma_{gamma_val}"
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
-    )
-    print(f"Scheduler initialized. Total steps: {num_training_steps}, Warmup: {num_warmup_steps}")
+        # --- Scheduler Setup 
+        num_training_steps = (len(train_loader) // accumulation_steps) * num_train_epochs
+        num_warmup_steps = int(num_training_steps * 0.1) 
 
-    # --- Training State 
-    best_f1 = 0.0  # To track the best model for this gamma
-    training_history = []  # List to store metrics for this gamma
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
+        print(f"Scheduler initialized. Total steps: {num_training_steps}, Warmup: {num_warmup_steps}")
 
-    print(f"Starting training on {device} for {num_train_epochs} epochs...")
+        # --- Training State 
+        best_f1 = 0.0 
+        training_history = [] 
 
-    for epoch in range(num_train_epochs):
-        start_time = time.time()
+        print(f"Starting training on {device} for {num_train_epochs} epochs...")
 
-        # --- Training Phase ---
-        model.train()  # Set model to training mode
-        total_train_loss = 0
-        optimizer.zero_grad()
+        for epoch in range(num_train_epochs):
+            start_time = time.time()
 
-        for i, batch in enumerate(train_loader):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            # --- Training Phase ---
+            model.train() 
+            total_train_loss = 0
+            optimizer.zero_grad()
 
-            # Use autocast for mixed precision
-            with autocast(device_type='cuda'):
-                # 1. DO NOT pass labels to the model
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
-                )
-                # 2. Get the logits
-                logits = outputs.logits
-
-                # 3. Calculate loss manually with our FocalLoss
-                loss = loss_fct(logits, labels)
-                loss = loss / accumulation_steps  # Normalize loss for accumulation
-
-            # Backward pass
-            scaler.scale(loss).backward()
-            total_train_loss += loss.item() * accumulation_steps
-
-            # Optimizer step (every accumulation_steps)
-            if (i + 1) % accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()  # Step the learning rate scheduler
-                optimizer.zero_grad()
-
-                # Logging
-                if (i + 1) % (50 * accumulation_steps) == 0:
-                    # Log the *first* learning rate (the body LR)
-                    current_lr = scheduler.get_last_lr()[0]
-                    print(
-                        f"  Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Avg Loss: {total_train_loss / (i + 1):.4f}, LR: {current_lr:.8f}")
-
-        avg_train_loss = total_train_loss / len(train_loader)
-
-        # --- Validation Phase ---
-        model.eval()
-        all_logits = []
-        all_labels = []
-
-        with torch.no_grad():
-            for batch in val_loader:
+            for i, batch in enumerate(train_loader):
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
 
-                with autocast(device_type='cuda', dtype=torch.float16):
+                with autocast(device_type='cuda'):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask
                     )
                     logits = outputs.logits
-                all_logits.append(logits.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
+                    loss = loss_fct(logits, labels)
+                    loss = loss / accumulation_steps 
 
-        eval_pred = (np.concatenate(all_logits), np.concatenate(all_labels))
-        metrics = compute_metrics(eval_pred)
-        epoch_f1 = metrics['f1_weighted']
-        epoch_acc = metrics['accuracy']
-        epoch_b_acc = metrics['balanced_accuracy']
+                scaler.scale(loss).backward()
+                total_train_loss += loss.item() * accumulation_steps
 
-        end_time = time.time()
-        print(f"\n--- Epoch {epoch + 1}/{num_train_epochs} Complete (Gamma={gamma_val}) ---")
-        print(f"Time: {end_time - start_time:.2f}s")
-        print(f"Avg Train Loss: {avg_train_loss:.4f}")
-        print(f"Validation F1 (Weighted): {epoch_f1:.4f}")
-        print(f"Validation Accuracy: {epoch_acc:.4f}")
-        print(f"Validation Balanced Accuracy: {epoch_b_acc:.4f}")
+                if (i + 1) % accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step() 
+                    optimizer.zero_grad()
 
-        # Save metrics to history
-        training_history.append({
-            'epoch': epoch + 1,
-            'train_loss': avg_train_loss,
-            'val_f1': epoch_f1,
-            'val_accuracy': epoch_acc,
-            'val_balanced_accuracy': epoch_b_acc
+                    if (i + 1) % (50 * accumulation_steps) == 0:
+                        current_lr = scheduler.get_last_lr()[0]
+                        print(
+                            f"  S:{strategy_name} G:{gamma_val} | "
+                            f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, "
+                            f"Avg Loss: {total_train_loss / (i + 1):.4f}, LR: {current_lr:.8f}"
+                        )
+
+            avg_train_loss = total_train_loss / len(train_loader)
+
+            # --- Validation Phase ---
+            model.eval()
+            all_logits = []
+            all_labels = []
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    labels = batch['labels'].to(device)
+
+                    with autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        )
+                        logits = outputs.logits
+                    all_logits.append(logits.cpu().numpy())
+                    all_labels.append(labels.cpu().numpy())
+
+            eval_pred = (np.concatenate(all_logits), np.concatenate(all_labels))
+            metrics = compute_metrics(eval_pred)
+            epoch_f1 = metrics['f1_weighted']
+            epoch_acc = metrics['accuracy']
+            epoch_b_acc = metrics['balanced_accuracy']
+
+            end_time = time.time()
+            print(f"\n--- Epoch {epoch + 1}/{num_train_epochs} Complete (Strategy={strategy_name}, Gamma={gamma_val}) ---")
+            print(f"Time: {end_time - start_time:.2f}s")
+            print(f"Avg Train Loss: {avg_train_loss:.4f}")
+            print(f"Validation F1 (Weighted): {epoch_f1:.4f}")
+            print(f"Validation Accuracy: {epoch_acc:.4f}")
+            print(f"Validation Balanced Accuracy: {epoch_b_acc:.4f}")
+
+            # Save metrics to history
+            training_history.append({
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_f1': epoch_f1,
+                'val_accuracy': epoch_acc,
+                'val_balanced_accuracy': epoch_b_acc
+            })
+
+            # Save Best Model *for this run*
+            if epoch_f1 > best_f1:
+                best_f1 = epoch_f1
+                print(f"New best model for {strategy_name}/gamma={gamma_val}! F1: {best_f1:.4f}. Saving to '{best_model_path}'...")
+                model.save_pretrained(best_model_path)
+                tokenizer.save_pretrained(best_model_path)
+
+            print("----------------------------------\n")
+
+        print(f"--- Training Complete for Strategy={strategy_name}, Gamma={gamma_val} ---")
+        print(f"Best Validation F1 score achieved: {best_f1:.4f}")
+
+        # Add experiment params to this run's history
+        for record in training_history:
+            record['gamma'] = gamma_val
+            record['strategy'] = strategy_name # 
+        
+        all_training_histories.extend(training_history)
+
+        # Save results for this experiment 
+        all_experiment_results.append({
+            'strategy': strategy_name, # ì
+            'gamma': gamma_val,
+            'best_f1': best_f1,
+            'best_model_path': best_model_path
         })
+        
+        # Track the OVERALL best model 
+        if best_f1 > overall_best_f1:
+            overall_best_f1 = best_f1
+            overall_best_model_path = best_model_path
+            print(f"This is the NEW OVERALL BEST model. Path: {overall_best_model_path} !!!")
 
-        # Save Best Model *for this run*
-        if epoch_f1 > best_f1:
-            best_f1 = epoch_f1
-            print(f"New best model for gamma={gamma_val}! F1: {best_f1:.4f}. Saving to '{best_model_path}'...")
-            model.save_pretrained(best_model_path)
-            tokenizer.save_pretrained(best_model_path)
-
-        print("----------------------------------\n")
-
-    print(f"--- Training Complete for Gamma={gamma_val} ---")
-    print(f"Best Validation F1 score achieved: {best_f1:.4f}")
-
-    # Add the gamma value to this run's history
-    for record in training_history:
-        record['gamma'] = gamma_val
-    
-    # Save the full history for this run
-    all_training_histories.extend(training_history)
-
-    # Save results for this experiment 
-    all_experiment_results.append({
-        'gamma': gamma_val,
-        'best_f1': best_f1,
-        'best_model_path': best_model_path
-    })
-    
-    # Track the OVERALL best model 
-    if best_f1 > overall_best_f1:
-        overall_best_f1 = best_f1
-        overall_best_model_path = best_model_path
-        print(f"This is the NEW OVERALL BEST model. Path: {overall_best_model_path} !!!")
-
-    all_experiment_results.append({
-         'gamma': gamma_val,
-         'best_f1': best_f1,
-         'best_model_path': best_model_path
-    })
 
 # Final Experiment Summary 
 print("\n==============================================")
-print("--- All Gamma Experiments Complete ---")
+print("--- All Experiments Complete ---")
 results_df = pd.DataFrame(all_experiment_results)
-print(results_df)
+# Sort by F1 score to see the best runs at the top
+print(results_df.sort_values(by='best_f1', ascending=False))
 
 # Master history df:
 all_history_df = pd.DataFrame(all_training_histories)
@@ -1121,49 +1124,64 @@ print("==============================================")
 #%%
 
 # -----------------------------------------------------------------
-# 5. PLOTTING AND FINAL EVALUATION  
+# 5. PLOTTING AND FINAL EVALUATION 
 # -----------------------------------------------------------------
 
 
 print("\n--- Generating Plots and Final Report ---")
 
-# --- Plot 1: Training & Validation Metrics ---
-# (This part will only plot the history of the *last* gamma value run.
-# To plot all, you'd need a more complex plotting loop.)
+# --- Plot 1: Training & Validation Metrics (FOR THE OVERALL BEST RUN) ---
+print("Generating plot for the *single best* run...")
 try:
-    history_df = pd.DataFrame(training_history) # 'training_history' holds the last run
+    # Find the best run from our results
+    best_run = results_df.loc[results_df['best_f1'].idxmax()]
+    best_gamma_val = best_run['gamma']
+    best_strategy_name = best_run['strategy']
+    
+    print(f"Best model was: Strategy='{best_strategy_name}', Gamma={best_gamma_val} (F1: {best_run['best_f1']:.4f})")
+
+    # Filter the master history for just this one run
+    best_history_df = all_history_df[
+        (all_history_df['gamma'] == best_gamma_val) & 
+        (all_history_df['strategy'] == best_strategy_name)
+    ]
     
     plt.figure(figsize=(12, 5))
     
     # Plot Loss
     plt.subplot(1, 2, 1)
-    plt.plot(history_df['epoch'], history_df['train_loss'], label=f'Training Loss (Gamma={gamma_val})', marker='o')
-    plt.title('Training Loss per Epoch (Last Run)')
+    plt.plot(best_history_df['epoch'], best_history_df['train_loss'], 
+             label=f'Train Loss (Best Run)', marker='o')
+    plt.title(f'Best Run Loss (Strategy: {best_strategy_name}, Gamma: {best_gamma_val})')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
     
-    # Plot F1 and Accuracy
+    # Plot F1, Accuracy, and Balanced Accuracy
     plt.subplot(1, 2, 2)
-    plt.plot(history_df['epoch'], history_df['val_f1'], label=f'Validation F1 (Gamma={gamma_val})', marker='o')
-    plt.plot(history_df['epoch'], history_df['val_accuracy'], label=f'Validation Accuracy (Gamma={gamma_val})', marker='o')
-    plt.title('Validation Metrics per Epoch (Last Run)')
+    plt.plot(best_history_df['epoch'], best_history_df['val_f1'], 
+             label=f'Validation F1', marker='o')
+    plt.plot(best_history_df['epoch'], best_history_df['val_accuracy'], 
+             label=f'Validation Accuracy', marker='s', linestyle='--')
+    plt.plot(best_history_df['epoch'], best_history_df['val_balanced_accuracy'], 
+             label=f'Validation Balanced Acc', marker='^', linestyle=':')
+    plt.title(f'Best Run Validation Metrics')
     plt.xlabel('Epoch')
     plt.ylabel('Score')
     plt.legend()
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('training_metrics_last_run.png')
-    print("Saved training metrics plot to 'training_metrics_last_run.png'")
+    plt.savefig('training_metrics_BEST_run.png')
+    print("Saved best run training metrics to 'training_metrics_BEST_run.png'")
     plt.close()
 
 except Exception as e:
-    print(f"Error generating training plot: {e}")
+    print(f"Error generating best run training plot: {e}")
 
 
-# --- Plot 2: Confusion Matrix & Classification Report ---
+# --- Plot 2: Confusion Matrix & Classification Report (from OVERALL best model) ---
 
 # We use the 'overall_best_model_path' variable we saved from the loop
 print(f"Loading OVERALL best model from '{overall_best_model_path}' for final evaluation...")
@@ -1195,8 +1213,6 @@ try:
     final_labels = np.concatenate(all_labels)
     final_preds = np.argmax(final_logits, axis=1)
     
-    # Get the string names for the labels
-    # We use the 'id2label' dictionary we created earlier
     label_names = [id2label[i] for i in range(len(id2label))]
     
     # 1. Print Classification Report
@@ -1221,18 +1237,15 @@ try:
     print("Saved confusion matrix plot to 'confusion_matrix.png'")
     plt.close()
 
-#   Normalize Confusion Matrix: 
+    # 3. Generate and Save Normalized Confusion Matrix
     print("Generating Normalized Confusion Matrix...")
-    
-    # Generate the normalized confusion matrix (normalized by true label/row)
-    # This shows what percentage of each true class was predicted correctly
     cm_normalized = confusion_matrix(final_labels, final_preds, normalize='true')
     
     plt.figure(figsize=(14, 10))
     sns.heatmap(
         cm_normalized, 
         annot=True, 
-        fmt='.2f',          # Format as a float with 2 decimal places
+        fmt='.2f', 
         cmap='Blues', 
         xticklabels=label_names, 
         yticklabels=label_names
@@ -1251,32 +1264,33 @@ except Exception as e:
     print(f"Error during final evaluation: {e}")
 
 
-# --- Plot 3: Training Dynamics (Gamma Comparison) ---
+# --- Plot 3: Training Dynamics (Strategy & Gamma Comparison) ---
 print("Generating Training Dynamics Comparison Plot...")
 try:
-    # We use the 'all_history_df' we created after the training loop
-    plt.figure(figsize=(10, 6))
-    
-    # Use seaborn's lineplot to automatically handle the groups
-    sns.lineplot(
+    # We use sns.relplot to create a grid of plots:
+    # One column for each 'strategy', with 'gamma' as the hue inside.
+    g = sns.relplot(
         data=all_history_df,
         x='epoch',
         y='val_f1',
-        hue='gamma',         # Color lines by gamma value
-        style='gamma',       # Use different line styles for gamma
-        markers=True,        # Add markers to each point
-        palette='viridis',   # Use the same color palette
-        lw=2                 # Line width
+        hue='gamma',        # Color lines by gamma value
+        style='gamma',      # Use different line styles for gamma
+        col='strategy',     # <-- NEW: Create columns for each strategy
+        kind='line',        # Make it a line plot
+        markers=True,
+        palette='viridis',
+        lw=2,
+        height=5,           # Height of each subplot
+        aspect=1.2          # Aspect ratio
     )
     
-    plt.title('Validation F1-Score Dynamics by Gamma Value', fontsize=16)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Validation F1-Score (Weighted)', fontsize=12)
-    plt.legend(title='Gamma')
-    plt.grid(True, linestyle='--', alpha=0.6)
+    g.fig.suptitle('Validation F1-Score Dynamics by Strategy and Gamma', y=1.03, fontsize=16)
+    g.set_axis_labels("Epoch", "Validation F1-Score (Weighted)")
+    
     plt.tight_layout()
-    plt.savefig('gamma_comparison_dynamics.png')
-    print("Saved plot to 'gamma_comparison_dynamics.png'")
+    plt_file_name = 'strategy_gamma_comparison_f1.png'
+    plt.savefig(plt_file_name)
+    print(f"Saved plot to '{plt_file_name}'")
     plt.close()
 
 except Exception as e:
@@ -1287,34 +1301,38 @@ except Exception as e:
 
 print("Generating Training Dynamics (Balanced Accuracy) Comparison Plot...")
 try:
-    # We use the 'all_history_df' we created after the training loop
-    plt.figure(figsize=(10, 6))
-    
-    # Use seaborn's lineplot, just change the y-axis
-    sns.lineplot(
+    # Repeat the same plot, but for 'val_balanced_accuracy'
+    g = sns.relplot(
         data=all_history_df,
         x='epoch',
-        y='val_balanced_accuracy',  # <--- THE ONLY CHANGE IS HERE
-        hue='gamma',                 # Color lines by gamma value
-        style='gamma',               # Use different line styles for gamma
-        markers=True,                # Add markers to each point
-        palette='viridis',           # Use the same color palette
-        lw=2                         # Line width
+        y='val_balanced_accuracy',  # <-- THE ONLY CHANGE IS HERE
+        hue='gamma',        
+        style='gamma',      
+        col='strategy',     # <-- NEW: Create columns for each strategy
+        kind='line',        
+        markers=True,
+        palette='viridis',
+        lw=2,
+        height=5,           
+        aspect=1.2          
     )
     
-    plt.title('Validation Balanced Accuracy Dynamics by Gamma Value', fontsize=16)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Validation Balanced Accuracy', fontsize=12)
-    plt.legend(title='Gamma')
-    plt.grid(True, linestyle='--', alpha=0.6)
+    g.fig.suptitle('Validation Balanced Accuracy Dynamics by Strategy and Gamma', y=1.03, fontsize=16)
+    g.set_axis_labels("Epoch", "Validation Balanced Accuracy")
+    
     plt.tight_layout()
-    plt.savefig('gamma_comparison_balanced_accuracy.png')
-    print("Saved plot to 'gamma_comparison_balanced_accuracy.png'")
+    plt_file_name = 'strategy_gamma_comparison_balanced_accuracy.png'
+    plt.savefig(plt_file_name)
+    print(f"Saved plot to '{plt_file_name}'")
     plt.close()
 
 except Exception as e:
     print(f"Error generating balanced accuracy dynamics plot: {e}")
 
+
+#%%
+# ... (Your Precision-Recall Curve cell is fine as-is) ...
+# ... (It will run on the 'overall_best_model_path' found by the new loop) ...
 
 #%%
 
@@ -1426,45 +1444,6 @@ except Exception as e:
     print(f"Error generating Precision-Recall curve: {e}")
 
 
-#%% --- Final Plot for Best Model ---
-
-# 1. Find the best gamma from the results_df
-best_run = results_df.loc[results_df['best_f1'].idxmax()]
-best_gamma_val = best_run['gamma']
-print(f"Best model was found with gamma = {best_gamma_val} (F1: {best_run['best_f1']:.4f})")
-
-# 2. Filter the master history for just this gamma
-best_history_df = all_history_df[all_history_df['gamma'] == best_gamma_val]
-
-# 3. Plot its dynamics
-plt.figure(figsize=(12, 5))
-
-# Plot Loss
-plt.subplot(1, 2, 1)
-plt.plot(best_history_df['epoch'], best_history_df['train_loss'], label=f'Training Loss (Best Run, Gamma={best_gamma_val})', marker='o')
-plt.title('Best Model: Training Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.grid(True)
-
-# Plot F1 and Accuracy
-plt.subplot(1, 2, 2)
-plt.plot(best_history_df['epoch'], best_history_df['val_f1'], label=f'Validation F1', marker='o')
-plt.plot(best_history_df['epoch'], best_history_df['val_accuracy'], label=f'Validation Accuracy', marker='o')
-plt.plot(best_history_df['epoch'], best_history_df['val_balanced_accuracy'], label=f'Validation Balanced Acc', marker='o', linestyle='--')
-plt.title('Best Model: Validation Metrics')
-plt.xlabel('Epoch')
-plt.ylabel('Score')
-plt.legend()
-plt.grid(True)
-
-plt.tight_layout()
-plt.savefig('training_metrics_BEST_run.png')
-print("Saved best run training metrics to 'training_metrics_BEST_run.png'")
-plt.close()
-
-
 # %% Comments: 
 
 
@@ -1517,4 +1496,883 @@ plt.close()
 # This way we can compare the two. 
 
 
-#%%  
+# 10/11 Comments: 
+
+# I performed the training, it takes roughly one hour and ten minutes. 
+# The results, as expected, are very bad due to unbalanced data. 
+# According to the F1 score the Best model was: Strategy='log_smoothed', Gamma=3.0 (F1: 0.3643)
+
+
+
+# Let's perform the data agumentation; How? 
+
+# In medical text, you cannot afford to randomly swap, delete, or insert words
+# Since we use a transformer, we don't need to pay for Google's API. 
+# We can run state-of-the-art translation models locally on the GPU for free. 
+
+# Model to use: 
+# The best models for this are from the Helsinki-NLP opus-mt series. 
+# They are lightweight, fast, and high-quality (they say).
+
+# We would need two models ( one from ENG to GER and the other from GER to ENG)
+
+# A great "starter pack" for augmentation:    
+# German (de): A high-quality Germanic language model.
+# French (fr) or Italian (it): A high-quality Romance language model.
+# Russian (ru): A high-quality Slavic language model.
+
+# Are there alternatives ? 
+
+# 1. Masked Language Model (MLM) Augmentation 
+# How ? 
+# Generates in-domain variations. 
+# Libraries like nlpaug can help implement this. 
+# Slightly riskier than back-translation, as it might predict a word that changes 
+# the meaning, but it's generally safe if you only mask one or two words
+
+# 2. Simple Synonym Replacement (WordNet) or  Easy Data Augmentation (EDA) (we should avoid these as they are risky.)
+
+# AGGRESSIVE CLEANING! 
+# Aside from data agumentation, we can remove some labels that only introduce noise in the dataset: 
+# Lables too generic "Letters", "SOAP" or "Office Notes" can be removed 
+# Labels too similar like "Neurology and Neurosurgery" can be mixed togheter 
+# Labels with less than 50 samples can be discarded (i think that even if we perform data augmentation we can't balance those classes)
+
+# The new model (model 3) should be trained on agumented and pre-processed data (the pre-processing function will change considering what i wrote in the lines above)
+
+
+
+
+#%%  Data Augmentation and Aggressive Clening: 
+
+# Cleaning strategy: 
+
+# Merge, drop and keep:
+
+# Surgery (Base Class): Surgery (1088)
+
+   # Merge with: Bariatrics (18) -> This is a type of GI surgery.
+
+   # Merge with: Cosmetic / Plastic Surgery (27) -> This is a type of surgery.
+
+   # New Class: "Surgery" (Total: 1133)
+
+# Neurology (Base Class): Neurology (223)
+
+ #   Merge with: Neurosurgery (94)
+
+  #  New Class: "Neurology / Neurosurgery" (Total: 317)
+
+
+# Drop all the noisy labels (just as before)
+
+
+# Consult - History and Phy. (516) - A neurologist, a surgeon, and a cardiologist all write "Consults."
+
+# SOAP / Chart / Progress Notes (166) - Document type.
+
+# Discharge Summary (108) - Document type.
+
+# Emergency Room Reports (75) - Document type / department.
+
+# General Medicine (259) - Too broad. Overlaps with everything.
+
+# Radiology (273) - This is a specialty, but its reports are structured dictations (what they see), not patient transcriptions (what they do). It's linguistically very different and adds noise.
+
+# Office Notes (50) - Document type.
+
+# Letters (23) - Document type.
+
+# IME-QME-Work Comp etc. (16) - Legal document type.
+
+# Lab Medicine - Pathology (8) - Report type, also too small.
+
+# Autopsy (8) - Report type, also too small.
+
+# We now drop labels with < 30 samples (too few only noise and using data agumentation would just add bias)
+# We should remain with 13 well defined classes to augment. 
+
+# First i will clean the data and look at the remaining labels 
+# Then i will perform data augmentation
+
+def aggressive_clean_data(data, min_samples=30):
+    """
+    Performs aggressive cleaning of the 'medical_specialty' column
+    based on the Model 3 strategy:
+    1. Drops NaNs and 'Unnamed: 0' column.
+    2. Merges similar classes (e.g., 'Bariatrics' -> 'Surgery').
+    3. Removes a specific list of noisy/document-type labels.
+    4. Filters out any remaining classes with < min_samples.
+    
+    Inputs: 
+            "data" = (DataFrame) The raw data to clean.
+            "min_samples" = (int) Threshold for the minimum samples per class.
+
+    Output: 
+            (DataFrame) The aggressively cleaned and filtered data.
+    """
+    print("--- Starting AGGRESSIVE Data Cleaning ---")
+    print(f"Original dataset shape: {data.shape}")
+    
+    # Make a copy to avoid SettingWithCopyWarning
+    data = data.copy()
+
+    # 1. Initial cleanup
+    if 'Unnamed: 0' in data.columns:
+        data = data.drop(columns=['Unnamed: 0'])
+        
+    data = data.dropna(subset=['transcription', 'medical_specialty'])
+    print(f"Shape after dropping NaNs: {data.shape}")
+
+    # 2. Merge similar specialties
+    merge_map = {
+        'Bariatrics': 'Surgery',
+        'Cosmetic / Plastic Surgery': 'Surgery',
+        'Neurosurgery': 'Neurology / Neurosurgery',
+        'Neurology': 'Neurology / Neurosurgery' # Map base class too
+    }
+    
+    data['medical_specialty'] = data['medical_specialty'].replace(merge_map)
+    print("Completed merging 'Bariatrics'/'Cosmetic' into 'Surgery' and 'Neurosurgery' into 'Neurology / Neurosurgery'.")
+
+    # 3. Define and remove "noisy" labels (document types, not specialties)
+    noisy_labels = [
+        'Consult - History and Phy.',
+        'SOAP / Chart / Progress Notes',
+        'Discharge Summary',
+        'Emergency Room Reports',
+        'General Medicine',
+        'Radiology',
+        'Office Notes',
+        'Letters',
+        'IME-QME-Work Comp etc.',
+        'Lab Medicine - Pathology',
+        'Autopsy'
+    ]
+    
+    noisy_count = data['medical_specialty'].isin(noisy_labels).sum()
+    print(f"Found {noisy_count} samples with noisy labels to remove.")
+    
+    data = data[~data['medical_specialty'].isin(noisy_labels)]
+    print(f"Shape after removing noisy labels: {data.shape}")
+
+    # 4. Handle class imbalance by removing specialties with < min_samples
+    specialty_counts = data['medical_specialty'].value_counts()
+    specialties_to_keep = specialty_counts[specialty_counts >= min_samples].index
+    
+    original_classes = data['medical_specialty'].nunique()
+    print(f"Classes before min_sample filter: {original_classes}")
+    
+    data = data[data['medical_specialty'].isin(specialties_to_keep)]
+    print(f"Shape after removing classes with < {min_samples} samples: {data.shape}")
+    
+    final_classes = data['medical_specialty'].nunique()
+    print(f"--- Aggressive Cleaning Complete ---")
+    print(f"Final number of classes: {final_classes}")
+    
+    return data.reset_index(drop=True)
+
+
+try:
+     clean_data_m3 = aggressive_clean_data(raw_data, min_samples=50)
+     print('Aggressive data cleaning completed successfully.')
+except KeyError:
+    print('"transcription" or "medical_specialty" column not found.')
+except Exception as e:
+    print(f"An error occurred: {e}")
+   
+print("\n--- New Class Distribution (After Aggressive Clean) ---")
+print(clean_data_m3['medical_specialty'].value_counts())
+
+# %% EDA wit the new dataframe:
+
+# New labels plot:
+# Plot the new distribution
+
+try:
+    plot_label_distribution(clean_data_m3, 'medical_specialty', 
+                  'Aggressively Cleaned Specialty Distribution', 
+                  'cleaned_medical_specialty_m3.png')
+except KeyError:
+    print('"medical_specialty" column not found.')
+except Exception as e:
+    print(f"An error occurred: {e}")
+
+
+NUM_LABELS_M3 = clean_data_m3['medical_specialty'].nunique()
+print(f"\nTotal number of classes for Model 3: {NUM_LABELS_M3}")
+
+#%% Back translation: 
+
+# Load translation models: 
+
+# ITA, GER
+print("Loading translation models...")
+models = {}
+tokenizers = {}
+
+# English to German and back
+model_name_en_de = "Helsinki-NLP/opus-mt-en-de"
+model_name_de_en = "Helsinki-NLP/opus-mt-de-en"
+tokenizers['en_de'] = AutoTokenizer.from_pretrained(model_name_en_de)
+models['en_de'] = AutoModelForSeq2SeqLM.from_pretrained(model_name_en_de).to(device)
+tokenizers['de_en'] = AutoTokenizer.from_pretrained(model_name_de_en)
+models['de_en'] = AutoModelForSeq2SeqLM.from_pretrained(model_name_de_en).to(device)
+
+# English to Italian and back
+model_name_en_it = "Helsinki-NLP/opus-mt-en-it"
+model_name_it_en = "Helsinki-NLP/opus-mt-it-en"
+tokenizers['en_it'] = AutoTokenizer.from_pretrained(model_name_en_it)
+models['en_it'] = AutoModelForSeq2SeqLM.from_pretrained(model_name_en_it).to(device)
+tokenizers['it_en'] = AutoTokenizer.from_pretrained(model_name_it_en)
+models['it_en'] = AutoModelForSeq2SeqLM.from_pretrained(model_name_it_en).to(device)
+
+print("All translation models loaded and moved to device.")
+
+# Back-Translation Function (with Batching) 
+def back_translate(texts, lang_pair, batch_size=16):
+    """
+    Performs back-translation on a list of texts using a specified lang_pair.
+    
+    Args:
+        texts (list): A list of sentences to translate.
+        lang_pair (str): 'de' or 'it' to select the models.
+        batch_size (int): How many texts to process at once.
+        
+    Returns:
+        list: A list of back-translated sentences.
+    """
+    
+    # Select models for the chosen language pair
+    tokenizer_en_xx = tokenizers[f'en_{lang_pair}']
+    model_en_xx = models[f'en_{lang_pair}']
+    tokenizer_xx_en = tokenizers[f'{lang_pair}_en']
+    model_xx_en = models[f'{lang_pair}_en']
+    
+    back_translated_texts = []
+    
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        
+        # 1. Translate EN -> XX
+        inputs_en_xx = tokenizer_en_xx(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+        translated_ids_xx = model_en_xx.generate(**inputs_en_xx, max_length=512)
+        translated_texts_xx = tokenizer_en_xx.batch_decode(translated_ids_xx, skip_special_tokens=True)
+
+        # 2. Translate XX -> EN
+        inputs_xx_en = tokenizer_xx_en(translated_texts_xx, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+        translated_ids_en = model_xx_en.generate(**inputs_xx_en, max_length=512)
+        back_translated_batch = tokenizer_xx_en.batch_decode(translated_ids_en, skip_special_tokens=True)
+        
+        back_translated_texts.extend(back_translated_batch)
+    
+    return back_translated_texts
+
+# Create New Splits & Mappings from Cleaned Data ---
+
+# Create new label mappings
+unique_specialties_m3 = sorted(clean_data_m3['medical_specialty'].unique())
+label2id_m3 = {label: i for i, label in enumerate(unique_specialties_m3)}
+id2label_m3 = {i: label for i, label in enumerate(unique_specialties_m3)}
+
+# Add integer 'label' column
+clean_data_m3['label'] = clean_data_m3['medical_specialty'].map(label2id_m3)
+
+# Split the aggressively cleaned data
+train_df_m3, val_df_m3 = train_test_split(
+    clean_data_m3,
+    test_size=0.2, # Same 80/20 split
+    stratify=clean_data_m3['label'],
+    random_state=42
+)
+
+print(f"\nCleaned training data shape: {train_df_m3.shape}")
+print(f"Cleaned validation data shape: {val_df_m3.shape} (THIS SHOULDN'T BE AUGMENTED)")
+
+# Identify Augmentation Targets 
+print("\n--- Starting Data Augmentation ---")
+
+# Let's set a reasonable target. 'Neurology / Neurosurgery' has ~250.
+# Let's augment all classes to have at least 250 samples.
+
+TARGET_SAMPLES = 250 
+AUGMENTATION_BATCH_SIZE = 16 # Batch size for translation models
+
+class_counts = train_df_m3['label'].value_counts()
+augmented_data_list = []
+
+# Loop through each class
+for label_id, count in class_counts.items():
+    specialty_name = id2label_m3[label_id]
+    
+    if count < TARGET_SAMPLES:
+        n_needed = TARGET_SAMPLES - count
+        print(f"Augmenting '{specialty_name}': Need to generate {n_needed} samples.")
+        
+        # Get all original texts for this class
+        minority_texts = train_df_m3[train_df_m3['label'] == label_id]['transcription'].tolist()
+        
+        n_generated = 0
+        while n_generated < n_needed:
+            # How many to generate in this batch
+            n_to_generate_now = min(AUGMENTATION_BATCH_SIZE, n_needed - n_generated)
+            
+            # Randomly sample from the original texts (with replacement)
+            texts_to_augment = np.random.choice(minority_texts, n_to_generate_now).tolist()
+            
+            # Alternate between DE and it for variety (as "Wafo suggested" )
+            if (n_generated // AUGMENTATION_BATCH_SIZE) % 2 == 0:
+                lang_pair = 'de'
+            else:
+                lang_pair = 'it'
+                
+            # Perform back-translation
+            new_texts = back_translate(texts_to_augment, lang_pair=lang_pair, batch_size=n_to_generate_now)
+            
+            # Add new (text, label) pairs to our list
+            for text in new_texts:
+                augmented_data_list.append({
+                    'transcription': text,
+                    'medical_specialty': specialty_name,
+                    'label': label_id
+                })
+            
+            n_generated += n_to_generate_now
+            if n_generated % (AUGMENTATION_BATCH_SIZE * 5) == 0:
+                print(f"  ... generated {n_generated}/{n_needed} for '{specialty_name}'")
+
+print("Augmentation complete.")
+
+# --- 2.5 Create Final Augmented Training Set ---
+augmented_df = pd.DataFrame(augmented_data_list)
+train_df_m3_final = pd.concat([train_df_m3, augmented_df]).reset_index(drop=True)
+
+print("\n--- Final Training Set Distribution (After Augmentation) ---")
+print(train_df_m3_final['medical_specialty'].value_counts().sort_index())
+print(f"\nOld training set size: {len(train_df_m3)}")
+print(f"New augmented training set size: {len(train_df_m3_final)}")
+
+
+
+
+# %% Training model 3: 
+
+
+# 1. Load Model with new configuration
+print(f"Loading model for {NUM_LABELS_M3} classes...")
+model_m3 = AutoModelForSequenceClassification.from_pretrained(
+    model_name, 
+    num_labels=NUM_LABELS_M3  
+)
+# We must update the model's config with the new M3 mappings
+model_m3.config.label2id = label2id_m3
+model_m3.config.id2label = id2label_m3
+model_m3.to(device)
+print(f"Model 3 loaded on: {device}")
+
+
+# 2. Instantiate Datasets
+print("\nCreating Model 3 training dataset (with augmentation)...")
+train_dataset_m3 = MedicalTranscriptionDataset(
+    dataframe=train_df_m3_final,
+    tokenizer=tokenizer
+)
+
+print("Creating Model 3 validation dataset (clean)...")
+val_dataset_m3 = MedicalTranscriptionDataset(
+    dataframe=val_df_m3, # The original, non-augmented validation set
+    tokenizer=tokenizer
+)
+
+# 3. Re-calculate Class Weights for the *new* augmented training set
+print("Calculating 'balanced' class weights for M3...")
+train_labels_m3 = train_df_m3_final['label'].values
+unique_labels_m3 = np.unique(train_labels_m3)
+
+class_weights_balanced_m3 = compute_class_weight(
+    'balanced', 
+    classes=unique_labels_m3, 
+    y=train_labels_m3
+)
+balanced_weights_tensor_m3 = torch.tensor(class_weights_balanced_m3, dtype=torch.float).to(device)
+
+print("Calculating 'log_smoothed' class weights for M3...")
+counts_m3 = train_df_m3_final['label'].value_counts().sort_index()
+log_weights_m3 = 1.0 / np.log(counts_m3.values + 1e-6)
+log_weights_m3 = (log_weights_m3 / np.sum(log_weights_m3)) * NUM_LABELS_M3
+log_smoothed_weights_tensor_m3 = torch.tensor(log_weights_m3, dtype=torch.float).to(device)
+
+# This dictionary will be looped over for Model 3
+weight_strategies_m3 = {
+    "balanced": balanced_weights_tensor_m3,
+    "log_smoothed": log_smoothed_weights_tensor_m3,
+    "unweighted": None
+}
+print(f"\nCreated {len(weight_strategies_m3)} weighting strategies for M3: {list(weight_strategies_m3.keys())}")
+
+
+# 4. Setup DataLoaders 
+print("Creating Model 3 DataLoaders...")
+train_loader_m3 = DataLoader(
+    train_dataset_m3,
+    batch_size=4, # per_device_train_batch_size
+    shuffle=True, # Shuffle training data
+)
+val_loader_m3 = DataLoader(
+    val_dataset_m3,
+    batch_size=8, #  per_device_eval_batch_size
+)
+
+# 5. Setup Scaler (already defined, but for clarity)
+scaler_m3 = GradScaler(device="cuda")
+
+# %%
+
+# %% --- Step 4: Model 3 Training, Visualization, and Final Evaluation ---
+
+# Configuration 
+num_train_epochs = 3 
+output_dir_m3 = "./clinical_bert_classifier_m3" # New output directory
+accumulation_steps = 4 
+
+# Hyperparameter Search Setup 
+gamma_values_to_test = [1.0, 2.0, 3.0] 
+all_experiment_results_m3 = []
+all_training_histories_m3 = [] 
+
+overall_best_f1_m3 = 0.0
+overall_best_model_path_m3 = "" 
+
+# ---OUTER LOOP FOR WEIGHTING STRATEGY ---
+for strategy_name, alpha_tensor in weight_strategies_m3.items():
+    
+    # --- INNER LOOP FOR GAMMA ---
+    for gamma_val in gamma_values_to_test:
+        print(f"\n========================================================")
+        print(f"--- STARTING MODEL 3 EXPERIMENT ---")
+        print(f"--- STRATEGY: {strategy_name}")
+        print(f"--- GAMMA:    {gamma_val}")
+        print(f"========================================================")
+
+        # Re-initialize model for a fresh run, using the M3 config
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            config=model_m3.config # Use M3 config with correct labels
+        ).to(device)
+        
+        # Setup Optimizer with Differential Learning Rates
+        lr_head = 1e-4 
+        lr_body = 2e-5 
+        head_param_names = [name for name, param in model.named_parameters() if name.startswith('classifier')]
+        params_body = [p for n, p in model.named_parameters() if n not in head_param_names and p.requires_grad]
+        params_head = [p for n, p in model.named_parameters() if n in head_param_names and p.requires_grad]
+        optimizer_grouped_parameters = [
+            {'params': params_body, 'lr': lr_body},
+            {'params': params_head, 'lr': lr_head}
+        ]
+        optimizer = optim.AdamW(optimizer_grouped_parameters)
+
+        # Create Loss Function using loop variables
+        loss_fct = FocalLoss(alpha=alpha_tensor, gamma=gamma_val)
+        print(f"FocalLoss created with strategy='{strategy_name}' and gamma={gamma_val}")
+        
+        # Make best_model_path unique for this run
+        best_model_path = f"{output_dir_m3}/best_model_strategy_{strategy_name}_gamma_{gamma_val}"
+
+        # --- Scheduler Setup 
+        num_training_steps = (len(train_loader_m3) // accumulation_steps) * num_train_epochs
+        num_warmup_steps = int(num_training_steps * 0.1) 
+
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
+        print(f"Scheduler initialized. Total steps: {num_training_steps}, Warmup: {num_warmup_steps}")
+
+        # --- Training State 
+        best_f1 = 0.0 
+        training_history = [] 
+
+        print(f"Starting MODEL 3 training on {device} for {num_train_epochs} epochs...")
+
+        for epoch in range(num_train_epochs):
+            start_time = time.time()
+
+            # --- Training Phase ---
+            model.train() 
+            total_train_loss = 0
+            optimizer.zero_grad()
+
+            for i, batch in enumerate(train_loader_m3): # Use M3 loader
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+
+                with autocast(device_type='cuda'):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits
+                    loss = loss_fct(logits, labels)
+                    loss = loss / accumulation_steps 
+
+                scaler_m3.scale(loss).backward() # Use M3 scaler
+                total_train_loss += loss.item() * accumulation_steps
+
+                if (i + 1) % accumulation_steps == 0:
+                    scaler_m3.step(optimizer)
+                    scaler_m3.update()
+                    scheduler.step() 
+                    optimizer.zero_grad()
+
+                    if (i + 1) % (100 * accumulation_steps) == 0: # Log less often, bigger dataset
+                        current_lr = scheduler.get_last_lr()[0]
+                        print(
+                            f"  M3 S:{strategy_name} G:{gamma_val} | "
+                            f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader_m3)}, "
+                            f"Avg Loss: {total_train_loss / (i + 1):.4f}, LR: {current_lr:.8f}"
+                        )
+
+            avg_train_loss = total_train_loss / len(train_loader_m3)
+
+            # --- Validation Phase ---
+            model.eval()
+            all_logits = []
+            all_labels = []
+
+            with torch.no_grad():
+                for batch in val_loader_m3: # Use M3 loader
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    labels = batch['labels'].to(device)
+
+                    with autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                        logits = outputs.logits
+                    all_logits.append(logits.cpu().numpy())
+                    all_labels.append(labels.cpu().numpy())
+
+            eval_pred = (np.concatenate(all_logits), np.concatenate(all_labels))
+            
+            # compute_metrics function is already defined from before
+            metrics = compute_metrics(eval_pred) 
+            epoch_f1 = metrics['f1_weighted']
+            epoch_acc = metrics['accuracy']
+            epoch_b_acc = metrics['balanced_accuracy']
+
+            end_time = time.time()
+            print(f"\n--- MODEL 3 Epoch {epoch + 1}/{num_train_epochs} Complete (Strategy={strategy_name}, Gamma={gamma_val}) ---")
+            print(f"Time: {end_time - start_time:.2f}s")
+            print(f"Avg Train Loss: {avg_train_loss:.4f}")
+            print(f"Validation F1 (Weighted): {epoch_f1:.4f}")
+            print(f"Validation Accuracy: {epoch_acc:.4f}")
+            print(f"Validation Balanced Accuracy: {epoch_b_acc:.4f}")
+
+            # Save metrics to history
+            training_history.append({
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_f1': epoch_f1,
+                'val_accuracy': epoch_acc,
+                'val_balanced_accuracy': epoch_b_acc
+            })
+
+            # Save Best Model *for this run*
+            if epoch_f1 > best_f1:
+                best_f1 = epoch_f1
+                print(f"New best model for M3 {strategy_name}/gamma={gamma_val}! F1: {best_f1:.4f}. Saving to '{best_model_path}'...")
+                model.save_pretrained(best_model_path)
+                tokenizer.save_pretrained(best_model_path) # Tokenizer is same, but good practice
+
+            print("----------------------------------\n")
+
+        print(f"--- MODEL 3 Training Complete for Strategy={strategy_name}, Gamma={gamma_val} ---")
+        print(f"Best Validation F1 score achieved: {best_f1:.4f}")
+
+        # Add experiment params to this run's history
+        for record in training_history:
+            record['gamma'] = gamma_val
+            record['strategy'] = strategy_name
+        
+        all_training_histories_m3.extend(training_history)
+
+        # Save results for this experiment 
+        all_experiment_results_m3.append({
+            'strategy': strategy_name,
+            'gamma': gamma_val,
+            'best_f1': best_f1,
+            'best_model_path': best_model_path
+        })
+        
+        # Track the OVERALL best model 
+        if best_f1 > overall_best_f1_m3:
+            overall_best_f1_m3 = best_f1
+            overall_best_model_path_m3 = best_model_path
+            print(f"This is the NEW OVERALL BEST MODEL 3. Path: {overall_best_model_path_m3} !!!")
+
+
+# Final Experiment Summary 
+print("\n==============================================")
+print("--- All MODEL 3 Experiments Complete ---")
+results_df_m3 = pd.DataFrame(all_experiment_results_m3)
+print(results_df_m3.sort_values(by='best_f1', ascending=False))
+
+# Master history df:
+all_history_df_m3 = pd.DataFrame(all_training_histories_m3)
+
+print("\n--- Overall Best MODEL 3 ---")
+print(f"Path: {overall_best_model_path_m3}")
+print(f"Best F1: {overall_best_f1_m3:.4f}")
+print("==============================================")
+
+
+# %% --- Step 5: PLOTTING AND FINAL EVALUATION (MODEL 3) ---
+
+print("\n--- Generating Plots and Final Report for MODEL 3 ---")
+
+# --- Plot 1: Training & Validation Metrics (FOR THE OVERALL BEST M3 RUN) ---
+print("Generating plot for the *single best M3* run...")
+try:
+    best_run_m3 = results_df_m3.loc[results_df_m3['best_f1'].idxmax()]
+    best_gamma_val_m3 = best_run_m3['gamma']
+    best_strategy_name_m3 = best_run_m3['strategy']
+    
+    print(f"Best M3 model was: Strategy='{best_strategy_name_m3}', Gamma={best_gamma_val_m3} (F1: {best_run_m3['best_f1']:.4f})")
+
+    best_history_df_m3 = all_history_df_m3[
+        (all_history_df_m3['gamma'] == best_gamma_val_m3) & 
+        (all_history_df_m3['strategy'] == best_strategy_name_m3)
+    ]
+    
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(best_history_df_m3['epoch'], best_history_df_m3['train_loss'], 
+             label=f'Train Loss (Best M3 Run)', marker='o')
+    plt.title(f'Best M3 Run Loss (Strategy: {best_strategy_name_m3}, Gamma: {best_gamma_val_m3})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(best_history_df_m3['epoch'], best_history_df_m3['val_f1'], 
+             label=f'Validation F1', marker='o')
+    plt.plot(best_history_df_m3['epoch'], best_history_df_m3['val_accuracy'], 
+             label=f'Validation Accuracy', marker='s', linestyle='--')
+    plt.plot(best_history_df_m3['epoch'], best_history_df_m3['val_balanced_accuracy'], 
+             label=f'Validation Balanced Acc', marker='^', linestyle=':')
+    plt.title(f'Best M3 Run Validation Metrics')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_metrics_BEST_run_m3.png') # New filename
+    print("Saved best run training metrics to 'training_metrics_BEST_run_m3.png'")
+    plt.close()
+
+except Exception as e:
+    print(f"Error generating best run training plot: {e}")
+
+
+# --- Plot 2: Confusion Matrix & Classification Report (from OVERALL best M3 model) ---
+print(f"Loading OVERALL best M3 model from '{overall_best_model_path_m3}' for final evaluation...")
+try:
+    best_model_m3 = AutoModelForSequenceClassification.from_pretrained(overall_best_model_path_m3)
+    best_model_m3.to(device)
+    best_model_m3.eval()
+
+    all_logits_m3 = []
+    all_labels_m3 = []
+
+    with torch.no_grad():
+        for batch in val_loader_m3: # Use M3 validation loader
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            with autocast(device_type='cuda', dtype=torch.float16):
+                outputs = best_model_m3(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                logits = outputs.logits
+            all_logits_m3.append(logits.cpu().numpy())
+            all_labels_m3.append(labels.cpu().numpy())
+
+    final_logits_m3 = np.concatenate(all_logits_m3)
+    final_labels_m3 = np.concatenate(all_labels_m3)
+    final_preds_m3 = np.argmax(final_logits_m3, axis=1)
+    
+    # Use the M3 label mapping
+    label_names_m3 = [id2label_m3[i] for i in range(len(id2label_m3))]
+    
+    print("\n--- Final Classification Report (Best MODEL 3) ---")
+    report_m3 = classification_report(final_labels_m3, final_preds_m3, target_names=label_names_m3)
+    print(report_m3)
+    
+    cm_m3 = confusion_matrix(final_labels_m3, final_preds_m3)
+    
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(cm_m3, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=label_names_m3, 
+                yticklabels=label_names_m3)
+    plt.title('Confusion Matrix (Best Model 3)', fontsize=16)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig('confusion_matrix_m3.png') # New filename
+    print("Saved confusion matrix plot to 'confusion_matrix_m3.png'")
+    plt.close()
+
+    print("Generating Normalized Confusion Matrix for M3...")
+    cm_normalized_m3 = confusion_matrix(final_labels_m3, final_preds_m3, normalize='true')
+    
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(
+        cm_normalized_m3, 
+        annot=True, 
+        fmt='.2f', 
+        cmap='Blues', 
+        xticklabels=label_names_m3, 
+        yticklabels=label_names_m3
+    )
+    plt.title('Normalized Confusion Matrix M3 (by True Label)', fontsize=16)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig('confusion_matrix_normalized_m3.png') # New filename
+    print("Saved normalized confusion matrix plot to 'confusion_matrix_normalized_m3.png'")
+    plt.close()
+
+except Exception as e:
+    print(f"Error during final M3 evaluation: {e}")
+
+
+# --- Plot 3: Training Dynamics (Strategy & Gamma Comparison for M3) ---
+print("Generating M3 Training Dynamics Comparison Plot (F1)...")
+try:
+    g = sns.relplot(
+        data=all_history_df_m3, # Use M3 history
+        x='epoch',
+        y='val_f1',
+        hue='gamma',
+        style='gamma',
+        col='strategy',
+        kind='line',
+        markers=True,
+        palette='viridis',
+        lw=2,
+        height=5,
+        aspect=1.2
+    )
+    g.fig.suptitle('MODEL 3 Validation F1-Score Dynamics by Strategy and Gamma', y=1.03, fontsize=16)
+    g.set_axis_labels("Epoch", "Validation F1-Score (Weighted)")
+    plt.tight_layout()
+    plt.savefig('strategy_gamma_comparison_f1_m3.png') # New filename
+    print("Saved plot to 'strategy_gamma_comparison_f1_m3.png'")
+    plt.close()
+
+except Exception as e:
+    print(f"Error generating M3 dynamics comparison plot: {e}")
+
+print("Generating M3 Training Dynamics Comparison Plot (Balanced Accuracy)...")
+try:
+    g = sns.relplot(
+        data=all_history_df_m3, # Use M3 history
+        x='epoch',
+        y='val_balanced_accuracy',
+        hue='gamma',
+        style='gamma',
+        col='strategy',
+        kind='line',
+        markers=True,
+        palette='viridis',
+        lw=2,
+        height=5,
+        aspect=1.2
+    )
+    g.fig.suptitle('MODEL 3 Validation Balanced Accuracy Dynamics by Strategy and Gamma', y=1.03, fontsize=16)
+    g.set_axis_labels("Epoch", "Validation Balanced Accuracy")
+    plt.tight_layout()
+    plt.savefig('strategy_gamma_comparison_balanced_accuracy_m3.png') # New filename
+    print("Saved plot to 'strategy_gamma_comparison_balanced_accuracy_m3.png'")
+    plt.close()
+
+except Exception as e:
+    print(f"Error generating M3 balanced accuracy dynamics plot: {e}")
+
+
+# --- Plot 4: Precision-Recall Curve (Best M3 Model) ---
+print("Generating Precision-Recall Curve for M3...")
+try:
+    # We need:
+    # 1. final_labels_m3 (true integer labels)
+    # 2. final_logits_m3 (raw model scores)
+    # 3. NUM_LABELS_M3 (total number of classes)
+    
+    y_scores_m3 = F.softmax(torch.tensor(final_logits_m3), dim=1).numpy()
+    y_true_bin_m3 = label_binarize(final_labels_m3, classes=list(range(NUM_LABELS_M3)))
+
+    precision = dict()
+    recall = dict()
+    average_precision = dict()
+    
+    for i in range(NUM_LABELS_M3):
+        precision[i], recall[i], _ = precision_recall_curve(
+            y_true_bin_m3[:, i], y_scores_m3[:, i]
+        )
+        average_precision[i] = average_precision_score(
+            y_true_bin_m3[:, i], y_scores_m3[:, i]
+        )
+
+    precision["micro"], recall["micro"], _ = precision_recall_curve(
+        y_true_bin_m3.ravel(), y_scores_m3.ravel()
+    )
+    average_precision["micro"] = average_precision_score(
+        y_true_bin_m3, y_scores_m3, average="micro"
+    )
+
+    all_recall = np.unique(np.concatenate([recall[i] for i in range(NUM_LABELS_M3)]))
+    mean_precision = np.zeros_like(all_recall)
+    for i in range(NUM_LABELS_M3):
+        mean_precision += np.interp(all_recall, recall[i][::-1], precision[i][::-1])
+    mean_precision /= NUM_LABELS_M3
+    average_precision["macro"] = np.mean(list(average_precision.values()))
+
+    plt.figure(figsize=(10, 8))
+    
+    plt.plot(
+        recall["micro"],
+        precision["micro"],
+        label=f'Micro-average PR (AP = {average_precision["micro"]:.3f})',
+        color='deeppink',
+        linestyle=':',
+        lw=3
+    )
+    plt.plot(
+        all_recall,
+        mean_precision,
+        label=f'Macro-average PR (AP = {average_precision["macro"]:.3f})',
+        color='navy',
+        linestyle='--',
+        lw=3
+    )
+
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('Multi-Class Precision-Recall Curve (Best Model 3)', fontsize=16)
+    plt.legend(loc='best')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig('precision_recall_curve_m3.png') # New filename
+    print("Saved plot to 'precision_recall_curve_m3.png'")
+    plt.close()
+
+except Exception as e:
+    print(f"Error generating M3 Precision-Recall curve: {e}")
+
