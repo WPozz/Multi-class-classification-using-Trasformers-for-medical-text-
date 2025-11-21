@@ -27,6 +27,9 @@ from wordcloud import WordCloud, STOPWORDS
 from sklearn.manifold import TSNE
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import label_binarize
+from tqdm.auto import tqdm
+import os
+
 
 print('Libraries imported successfully!')
 
@@ -58,6 +61,8 @@ except FileNotFoundError:
 print("\n--- Initial Data Info ---")
 raw_data.info()
 
+
+#%% EDA: 
    
 def plot_label_distribution(raw_data, column, title, filename):
     
@@ -551,6 +556,9 @@ def clean_medical_specialties(data, min_samples=20):
     data = data.dropna(subset=['transcription', 'medical_specialty'])
     print(f"Shape after dropping NaNs: {data.shape}")
 
+    # Strip leading/trailing whitespace from the column to ensure clean matching.
+    data['medical_specialty'] = data['medical_specialty'].str.strip()
+
     # 2. Define and remove "noisy" labels (document types, not specialties)
     noisy_labels = [
         'SOAP / Chart / Progress Notes',
@@ -960,7 +968,7 @@ all_training_histories = []
 overall_best_f1 = 0.0
 overall_best_model_path = "" 
 
-# ---OUTER LOOP FOR WEIGHTING STRATEGY ---
+# Wheighting strategy loop: 
 for strategy_name, alpha_tensor in weight_strategies.items():
     
     # --- INNER LOOP FOR GAMMA ---
@@ -1345,10 +1353,10 @@ try:
     g = sns.relplot(
         data=all_history_df,
         x='epoch',
-        y='val_balanced_accuracy',  # <-- THE ONLY CHANGE IS HERE
+        y='val_balanced_accuracy',  
         hue='gamma',        
         style='gamma',      
-        col='strategy',     # <-- NEW: Create columns for each strategy
+        col='strategy',     
         kind='line',        
         markers=True,
         palette='viridis',
@@ -1660,7 +1668,8 @@ def aggressive_clean_data(data, min_samples=30):
     # 1. Initial cleanup
     if 'Unnamed: 0' in data.columns:
         data = data.drop(columns=['Unnamed: 0'])
-        
+    
+    data['medical_specialty'] = data['medical_specialty'].str.strip()
     data = data.dropna(subset=['transcription', 'medical_specialty'])
     print(f"Shape after dropping NaNs: {data.shape}")
 
@@ -1689,6 +1698,7 @@ def aggressive_clean_data(data, min_samples=30):
         'Lab Medicine - Pathology',
         'Autopsy'
     ]
+    
     
     noisy_count = data['medical_specialty'].isin(noisy_labels).sum()
     print(f"Found {noisy_count} samples with noisy labels to remove.")
@@ -1723,6 +1733,8 @@ except Exception as e:
    
 print("\n--- New Class Distribution (After Aggressive Clean) ---")
 print(clean_data_m3['medical_specialty'].value_counts())
+print('Mean number of samples per class after cleaning:', clean_data_m3['medical_specialty'].value_counts().mean())
+print('Median number of samples per class after cleaning:', clean_data_m3['medical_specialty'].value_counts().median())
 
 # %% EDA wit the new dataframe:
 
@@ -1742,6 +1754,8 @@ except Exception as e:
 NUM_LABELS_M3 = clean_data_m3['medical_specialty'].nunique()
 print(f"\nTotal number of classes for Model 3: {NUM_LABELS_M3}")
 
+# One can add the other EDA plots here 
+
 #%% Back translation: 
 
 # Load translation models: 
@@ -1750,6 +1764,15 @@ print(f"\nTotal number of classes for Model 3: {NUM_LABELS_M3}")
 print("Loading translation models...")
 models = {}
 tokenizers = {}
+
+# We define again "device" if the previous part of the code was not run: 
+if 'device' not in globals():
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+else:
+    device = device
+
+
 
 # English to German and back
 model_name_en_de = "Helsinki-NLP/opus-mt-en-de"
@@ -1818,14 +1841,14 @@ id2label_m3 = {i: label for i, label in enumerate(unique_specialties_m3)}
 # Add integer 'label' column
 clean_data_m3['label'] = clean_data_m3['medical_specialty'].map(label2id_m3)
 
-# --- NEW 2-STEP SPLIT ---
+# Step split 
 # 1. First, split into (train+validation) and (test)
-# We'll hold out 15% of the data for the final test
+# Hold out 15% of the data for the final test
 train_val_df_m3, test_df_m3 = train_test_split(
     clean_data_m3,
     test_size=0.15, # 15% for the final, hold-out test set
     stratify=clean_data_m3['label'],
-    random_state=42 # Use the global SEED we set
+    random_state=42 
 )
 
 # 2. Now, split the (train+validation) set into train and validation
@@ -1852,7 +1875,7 @@ print("\n--- Starting Data Augmentation ---")
 # Let's set a reasonable target. 'Neurology / Neurosurgery' has ~250.
 # Let's augment all classes to have at least 250 samples.
 
-TARGET_SAMPLES = 250 
+TARGET_SAMPLES = 300
 AUGMENTATION_BATCH_SIZE = 16 # Batch size for translation models
 
 class_counts = train_df_m3['label'].value_counts()
@@ -1996,7 +2019,6 @@ test_loader_m3 = DataLoader(
 # 5. Setup Scaler (already defined, but for clarity)
 scaler_m3 = GradScaler(device="cuda")
 
-# %%
 
 # %% --- Step 4: Model 3 Training, Visualization, and Final Evaluation ---
 
@@ -2180,7 +2202,7 @@ for strategy_name, alpha_tensor in weight_strategies_m3.items():
             print(f"This is the NEW OVERALL BEST MODEL 3. Path: {overall_best_model_path_m3} !!!")
 
 
-# Final Experiment Summary 
+
 print("\n==============================================")
 print("--- All MODEL 3 Experiments Complete ---")
 results_df_m3 = pd.DataFrame(all_experiment_results_m3)
@@ -2429,3 +2451,4 @@ try:
 except Exception as e:
     print(f"Error generating M3 Precision-Recall curve: {e}")
 
+#%% 
